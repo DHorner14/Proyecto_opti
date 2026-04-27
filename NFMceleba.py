@@ -2,7 +2,6 @@ import os
 import csv
 import time
 import numpy as np
-import pandas as pd
 from PIL import Image
 from pathlib import Path
 from datetime import datetime
@@ -10,134 +9,117 @@ from datetime import datetime
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────
-IMG_DIR   = Path("img_align_celeba/img_align_celeba")  # ruta a las imágenes
-IMG_SIZE  = (64, 64)
-M         = IMG_SIZE[0] * IMG_SIZE[1]   # 4096 píxeles por imagen
-LOG_CSV   = Path("runs_log.csv")
+IMG_DIR     = Path("img_align_celeba/img_align_celeba")
+IMG_SIZE    = (64, 64)
+M           = IMG_SIZE[0] * IMG_SIZE[1]
+DATA_FILE   = "celeba_64.npy"
+LOG_CSV     = Path("runs_log.csv")
 WEIGHTS_DIR = Path("weights")
 WEIGHTS_DIR.mkdir(exist_ok=True)
 
-# ─────────────────────────────────────────────
-# 1. CARGA DE DATOS EN BATCHES
-# ─────────────────────────────────────────────
-def load_batch(paths: list[Path]) -> np.ndarray:
 
-    cols = []
-    for p in paths:
+# ─────────────────────────────────────────────
+# 1. PREPROCESAMIENTO (SOLO UNA VEZ)
+# ─────────────────────────────────────────────
+def preprocess_dataset(img_dir, output_file=DATA_FILE, max_images=200000):
+    if os.path.exists(output_file):
+        print(f"Dataset ya existe: {output_file}")
+        return
+
+    paths = sorted(img_dir.glob("*.jpg"))[:max_images]
+    print(f"Preprocesando {len(paths)} imágenes...")
+    X = np.empty((len(paths), M), dtype=np.float32)
+
+    for i, p in enumerate(paths):
         img = Image.open(p).convert("L").resize(IMG_SIZE)
-        cols.append(np.array(img, dtype=np.float32).flatten() / 255.0)
-    return np.column_stack(cols)   # shape: (M, batch_size)
+        X[i] = np.asarray(img, dtype=np.float32).flatten() / 255.0
+        if i % 5000 == 0:
+            print(f"  {i}/{len(paths)}")
+
+    np.save(output_file, X)
+    print(f"Dataset guardado en {output_file}  shape={X.shape}")
 
 
-def split_paths(img_dir: Path, train=0.70, val=0.20, seed=42):
-    """Divide los paths de imágenes en train/val/test."""
-    paths = sorted(img_dir.glob("*.jpg"))[:500]
+# ─────────────────────────────────────────────
+# 2. SPLITS SOBRE ÍNDICES
+# ─────────────────────────────────────────────
+def split_indices(n_samples, train=0.70, val=0.20, seed=42):
     np.random.seed(seed)
-    idx   = np.random.permutation(len(paths))
-    n     = len(paths)
-    n_tr  = int(train * n)
-    n_val = int(val   * n)
-    return (
-        [paths[i] for i in idx[:n_tr]],
-        [paths[i] for i in idx[n_tr:n_tr+n_val]],
-        [paths[i] for i in idx[n_tr+n_val:]]
-    )
+    idx     = np.random.permutation(n_samples)
+    n_train = int(train * n_samples)
+    n_val   = int(val   * n_samples)
+    return idx[:n_train], idx[n_train:n_train+n_val], idx[n_train+n_val:]
 
 
 # ─────────────────────────────────────────────
-# 2. PROYECCIÓN NMF
+# 3. CARGA DE BATCH RÁPIDO
 # ─────────────────────────────────────────────
-def proj(A: np.ndarray) -> np.ndarray:
-    """Proyecta sobre el ortante no-negativo."""
+def load_batch(X_full, indices):
+    return X_full[indices].T.astype(np.float32)   # (M, batch_size)
+
+
+# ─────────────────────────────────────────────
+# 4. UTILIDADES NMF
+# ─────────────────────────────────────────────
+def proj(A):
     return np.maximum(A, 0)
 
+def gradients(W, H, X):
+    R = (W @ H - X).astype(np.float32)
+    return R @ H.T, W.T @ R
 
-# ─────────────────────────────────────────────
-# 3. GRADIENTES
-# ─────────────────────────────────────────────
-def gradients(W: np.ndarray, H: np.ndarray, X: np.ndarray):
-    """
-    Calcula gradientes de f = ½‖X - WH‖²_F
-    ∇_W f = (WH - X) H^T
-    ∇_H f = W^T (WH - X)
-    """
-    R = W @ H - X          # residual (M, n)
-    gW = R @ H.T           # (M, k)
-    gH = W.T @ R           # (k, n)
-    return gW, gH
-
-
-def loss(W: np.ndarray, H: np.ndarray, X: np.ndarray) -> float:
-    R = W @ H - X
+def loss(W, H, X):
+    R = (W @ H - X).astype(np.float32)
     return 0.5 * np.sum(R ** 2)
 
 
 # ─────────────────────────────────────────────
-# 4. PASO DE OPTIMIZACIÓN (GD / Momentum / NAG)
+# 5. UPDATES
 # ─────────────────────────────────────────────
 def update_W(W, H, X, vW, alpha, beta, method):
     if method == "gd":
         gW, _ = gradients(W, H, X)
-        W = proj(W - alpha * gW)
-        return W, vW
-
+        return proj(W - alpha * gW), vW
     elif method == "momentum":
         gW, _ = gradients(W, H, X)
         vW = beta * vW + gW
-        W  = proj(W - alpha * vW)
-        return W, vW
-
+        return proj(W - alpha * vW), vW
     elif method == "nesterov":
-        W_look = W - alpha * beta * vW
-        W_look = proj(W_look)
+        W_look = proj(W - alpha * beta * vW)
         gW, _  = gradients(W_look, H, X)
         vW = beta * vW + gW
-        W  = proj(W - alpha * vW)
-        return W, vW
-
-    raise ValueError(f"Método desconocido: {method}")
-
+        return proj(W - alpha * vW), vW
+    raise ValueError("Método inválido")
 
 def update_H(W, H, X, vH, alpha, beta, method):
     if method == "gd":
         _, gH = gradients(W, H, X)
-        H = proj(H - alpha * gH)
-        return H, vH
-
+        return proj(H - alpha * gH), vH
     elif method == "momentum":
         _, gH = gradients(W, H, X)
         vH = beta * vH + gH
-        H  = proj(H - alpha * vH)
-        return H, vH
-
+        return proj(H - alpha * vH), vH
     elif method == "nesterov":
-        H_look = H - alpha * beta * vH
-        H_look = proj(H_look)
+        H_look = proj(H - alpha * beta * vH)
         _, gH  = gradients(W, H_look, X)
         vH = beta * vH + gH
-        H  = proj(H - alpha * vH)
-        return H, vH
-
-    raise ValueError(f"Método desconocido: {method}")
+        return proj(H - alpha * vH), vH
+    raise ValueError("Método inválido")
 
 
 # ─────────────────────────────────────────────
-# 5. EVALUACIÓN EN VAL/TEST
+# 6. EVALUACIÓN
 # ─────────────────────────────────────────────
-def evaluate(W, val_paths, batch_size, alpha_H, inner_H, seed=0):
-    """
-    Fija W, resuelve H_val por GD no-negativo, calcula RMSE.
-    """
+def evaluate(W, X_full, val_idx, batch_size, alpha_H, inner_H=5, seed=0):
     np.random.seed(seed)
-    sq_err = 0.0
-    total  = 0
+    sq_err, total = 0.0, 0
 
-    for i in range(0, len(val_paths), batch_size):
-        batch = val_paths[i:i+batch_size]
-        X_b   = load_batch(batch)            # (M, b)
-        k     = W.shape[1]
-        H_b   = np.random.uniform(0, 1/np.sqrt(k), (k, X_b.shape[1])).astype(np.float32)
-        vH    = np.zeros_like(H_b)
+    for i in range(0, len(val_idx), batch_size):
+        idx_batch = val_idx[i:i+batch_size]
+        X_b = load_batch(X_full, idx_batch)
+        k   = W.shape[1]
+        H_b = np.random.uniform(0, 1/np.sqrt(k), (k, X_b.shape[1])).astype(np.float32)
+        vH  = np.zeros_like(H_b)
 
         for _ in range(inner_H):
             H_b, vH = update_H(W, H_b, X_b, vH, alpha_H, beta=0.0, method="gd")
@@ -149,101 +131,90 @@ def evaluate(W, val_paths, batch_size, alpha_H, inner_H, seed=0):
 
 
 # ─────────────────────────────────────────────
-# 6. LOGGING
+# 7. LOGGING Y GUARDADO
 # ─────────────────────────────────────────────
 def log_run(params: dict, results: dict):
-    """Guarda los parámetros y resultados en runs_log.csv."""
     row = {**params, **results, "timestamp": datetime.now().isoformat()}
     file_exists = LOG_CSV.exists()
-
-    with open(LOG_CSV, "a", newline="") as f:
+    with open(LOG_CSV, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=row.keys())
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
-
-    print(f"\nRun guardado en {LOG_CSV}")
-
+    print(f"Run guardado en {LOG_CSV}")
 
 def save_weights(W, H, run_id: str):
-    """Guarda W y H como archivos .npy."""
     np.save(WEIGHTS_DIR / f"{run_id}_W.npy", W)
     np.save(WEIGHTS_DIR / f"{run_id}_H.npy", H)
-    print(f"Pesos guardados en {WEIGHTS_DIR}/{run_id}_W.npy y _H.npy")
+    print(f"Pesos guardados en weights/{run_id}_W.npy y _H.npy")
 
 
 # ─────────────────────────────────────────────
-# 7. ENTRENAMIENTO PRINCIPAL (BCGD + BATCHES)
+# 8. TRAIN
 # ─────────────────────────────────────────────
 def train(
-    k          = 50,
-    steps      = 200,
-    batch_size = 20,
+    k          = 100,
+    steps      = 300,
+    batch_size = 1024,
     alpha_W    = 1e-3,
     alpha_H    = 1e-3,
     beta       = 0.9,
-    method     = "gd",   # "gd" | "momentum" | "nesterov"
+    method     = "nesterov",
     inner_W    = 1,
     inner_H    = 1,
     seed       = 42,
-    eval_every = 10,           # evaluar en val cada N steps
+    eval_every = 50,
 ):
     np.random.seed(seed)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # ── Cargar splits ──────────────────────────
-    print("Cargando splits...")
-    train_paths, val_paths, test_paths = split_paths(IMG_DIR)
-    print(f"  Train: {len(train_paths):,}  Val: {len(val_paths):,}  Test: {len(test_paths):,}")
+    preprocess_dataset(IMG_DIR)
+    print("Cargando dataset...")
+    X_full = np.load(DATA_FILE, mmap_mode="r")
 
-    # ── Inicialización de W y H ────────────────
-    # W se inicializa una vez global; H se reinicia por batch
+    train_idx, val_idx, test_idx = split_indices(len(X_full), seed=seed)
+    print(f"  Train: {len(train_idx):,}  Val: {len(val_idx):,}  Test: {len(test_idx):,}")
+
     W  = np.random.uniform(0, 1/np.sqrt(k), (M, k)).astype(np.float32)
     vW = np.zeros_like(W)
 
-    loss_history = []
-    val_rmse_history = []
+    loss_history     = []
+    val_steps_list   = []
+    val_rmse_list    = []
     t0 = time.time()
 
-    # ── Loop de entrenamiento ──────────────────
     for step in range(1, steps + 1):
+        batch_idx = np.random.choice(train_idx, size=batch_size, replace=False)
+        X_batch   = load_batch(X_full, batch_idx)
 
-        # Muestrear un batch aleatorio del train set
-        batch_idx   = np.random.choice(len(train_paths), size=batch_size, replace=False)
-        batch_paths = [train_paths[i] for i in batch_idx]
-        X_batch     = load_batch(batch_paths)   # (M, batch_size)
-
-        # Inicializar H para este batch
         H_batch = np.random.uniform(0, 1/np.sqrt(k), (k, batch_size)).astype(np.float32)
         vH      = np.zeros_like(H_batch)
 
-        # ── Actualizar H (bloque H) ────────────
         for _ in range(inner_H):
             H_batch, vH = update_H(W, H_batch, X_batch, vH, alpha_H, beta, method)
-
-        # ── Actualizar W (bloque W) ────────────
         for _ in range(inner_W):
             W, vW = update_W(W, H_batch, X_batch, vW, alpha_W, beta, method)
 
-        # ── Loss del batch ─────────────────────
         batch_loss = loss(W, H_batch, X_batch) / batch_size
-        loss_history.append(batch_loss)
+        loss_history.append(float(batch_loss))
 
-        # ── Evaluación en val ──────────────────
         if step % eval_every == 0 or step == 1:
-            val_rmse = evaluate(W, val_paths[:500], batch_size, alpha_H, inner_H=50)
-            val_rmse_history.append((step, val_rmse))
+            val_rmse = evaluate(W, X_full, val_idx, batch_size, alpha_H, inner_H=5)
+            val_steps_list.append(step)
+            val_rmse_list.append(val_rmse)
             elapsed = time.time() - t0
             print(f"Step {step:>4}/{steps}  loss={batch_loss:.4f}  val_RMSE={val_rmse:.4f}  t={elapsed:.1f}s")
 
-    # ── Evaluación final en test ───────────────
-    print("\nEvaluando en test set...")
-    test_rmse = evaluate(W, test_paths[:500], batch_size, alpha_H, inner_H=50)
+    print("Evaluando en test set...")
+    test_rmse = evaluate(W, X_full, test_idx, batch_size, alpha_H, inner_H=5)
     print(f"Test RMSE: {test_rmse:.4f}")
 
-    # ── Guardar pesos ──────────────────────────
-    # H final = último batch (representativo)
+    # ── Guardar pesos y curvas ─────────────────
+    # val se guarda en 2 arrays separados para evitar dtype=object
     save_weights(W, H_batch, run_id)
+    np.save(WEIGHTS_DIR / f"{run_id}_loss.npy",      np.array(loss_history,   dtype=np.float32))
+    np.save(WEIGHTS_DIR / f"{run_id}_val_steps.npy", np.array(val_steps_list, dtype=np.int32))
+    np.save(WEIGHTS_DIR / f"{run_id}_val_rmse.npy",  np.array(val_rmse_list,  dtype=np.float32))
 
     # ── Logging ───────────────────────────────
     params = dict(
@@ -254,64 +225,60 @@ def train(
     )
     results = dict(
         final_loss=round(loss_history[-1], 6),
-        val_rmse_final=round(val_rmse_history[-1][1], 6),
+        val_rmse_final=round(val_rmse_list[-1], 6),
         test_rmse=round(test_rmse, 6),
-        train_images=len(train_paths),
-        val_images=len(val_paths),
-        test_images=len(test_paths),
+        train_images=len(train_idx),
+        val_images=len(val_idx),
+        test_images=len(test_idx),
         elapsed_s=round(time.time() - t0, 1)
     )
     log_run(params, results)
+    plot_results(loss_history, val_steps_list, val_rmse_list, run_id)
 
-    # Plot results
-    plot_results(loss_history, val_rmse_history, run_id)
-
-    return W, H_batch, loss_history, val_rmse_history
+    return W
 
 
 # ─────────────────────────────────────────────
-# 7. GRAPHING
+# 9. GRÁFICAS
 # ─────────────────────────────────────────────
-def plot_results(loss_history, val_rmse_history, run_id):
-    """Plot training loss and validation RMSE."""
+def plot_results(loss_history, val_steps, val_rmses, run_id):
     import matplotlib.pyplot as plt
-    
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-    
-    # Plot loss
+
     ax1.plot(loss_history, linewidth=1.5)
     ax1.set_xlabel("Step")
     ax1.set_ylabel("Loss")
     ax1.set_title("Training Loss")
     ax1.grid(True, alpha=0.3)
-    
-    # Plot validation RMSE
-    val_steps, val_rmses = zip(*val_rmse_history)
-    ax2.plot(val_steps, val_rmses, linewidth=1.5, marker='o', markersize=4)
+
+    if val_steps:
+        ax2.plot(val_steps, val_rmses, linewidth=1.5, marker="o", markersize=4)
     ax2.set_xlabel("Step")
     ax2.set_ylabel("Validation RMSE")
     ax2.set_title("Validation RMSE")
     ax2.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
     plt.savefig(f"results_{run_id}.png", dpi=100)
     plt.show()
+    print(f"Gráfica guardada: results_{run_id}.png")
 
 
 # ─────────────────────────────────────────────
-# 8. ENTRY POINT
+# ENTRY POINT
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    W, H, loss_hist, val_hist = train(
-        k          = 50,
-        steps      = 200,
-        batch_size = 20,
+    train(
+        k          = 100,
+        steps      = 300,
+        batch_size = 1024,
         alpha_W    = 1e-3,
         alpha_H    = 1e-3,
         beta       = 0.9,
-        method     = "gd",
+        method     = "nesterov",
         inner_W    = 1,
         inner_H    = 1,
         seed       = 42,
-        eval_every = 10,
+        eval_every = 50,
     )
